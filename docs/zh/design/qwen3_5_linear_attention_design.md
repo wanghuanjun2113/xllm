@@ -392,15 +392,15 @@ $$
 
 **Decode 路径输入形状**：
 
-```
-q:     [B, H_v^(tp), d_k]     （已做 L2 norm + scale）
-k:     [B, H_v^(tp), d_k]     （已做 L2 norm）
-v:     [B, H_v^(tp), d_v]
-g:     [B, H_v^(tp)]           （用于 exp(g) 计算衰减）
-beta:  [B, H_v^(tp)]           （sigmoid 门控）
-ssm_cache: [B, H_v^(tp), d_v, d_k]  （即 S_{t-1}，注意 NPU kernel 使用 d_v × d_k 布局）
-scale: 1/sqrt(d_k)
-```
+| 参数 | 形状 | 说明 |
+| --- | --- | --- |
+| `q` | $[B, H_v^{(tp)}, d_k]$ | 已做 L2 norm + scale |
+| `k` | $[B, H_v^{(tp)}, d_k]$ | 已做 L2 norm |
+| `v` | $[B, H_v^{(tp)}, d_v]$ | — |
+| `g` | $[B, H_v^{(tp)}]$ | 用于 $\exp(g)$ 计算衰减 |
+| `beta` | $[B, H_v^{(tp)}]$ | sigmoid 门控 |
+| `ssm_cache` | $[B, H_v^{(tp)}, d_v, d_k]$ | 即 $S_{t-1}$，NPU kernel 使用 $d_v \times d_k$ 布局 |
+| `scale` | $1/\sqrt{d_k}$ | 缩放因子 |
 
 输出：`core_attn_out`: $[B, 1, H_v^{(tp)}, d_v]$
 
@@ -430,20 +430,21 @@ Torch 参考实现：`torch_chunk_gated_delta_rule()`（`qwen3_gated_delta_net_b
 - 调用位置：`qwen3_gated_delta_net_base.cpp:429-450`
 
 **ChunkGatedDeltaRuleParams 参数说明**：
-```
-q:              [B, T, H_k^(tp), d_k]
-k:              [B, T, H_k^(tp), d_k]
-v:              [B, T, H_v^(tp), d_v]
-g:              [B, T, H_v^(tp)]         (float32)
-beta:           [B, T, H_v^(tp)]         (bf16)
-initial_state:  [B, H_v^(tp), d_k, d_v]  （当前实现填 0）
-scale:          auto (1/sqrt(d_k))
-chunk_size:     64
-use_qk_l2norm_in_kernel: true
-head_first:     false
-output_final_state: true
-cu_seqlens:     [B+1] int32
-```
+
+| 参数 | 形状 | 说明 |
+| --- | --- | --- |
+| `q` | $[B, T, H_k^{(tp)}, d_k]$ | — |
+| `k` | $[B, T, H_k^{(tp)}, d_k]$ | — |
+| `v` | $[B, T, H_v^{(tp)}, d_v]$ | — |
+| `g` | $[B, T, H_v^{(tp)}]$ | float32 |
+| `beta` | $[B, T, H_v^{(tp)}]$ | bf16 |
+| `initial_state` | $[B, H_v^{(tp)}, d_k, d_v]$ | 当前实现填 0 |
+| `scale` | auto | $1/\sqrt{d_k}$ |
+| `chunk_size` | 64 | — |
+| `use_qk_l2norm_in_kernel` | true | — |
+| `head_first` | false | — |
+| `output_final_state` | true | — |
+| `cu_seqlens` | $[B+1]$ | int32 |
 
 输出：
 - `core_attn_out`: $[B, T, H_v^{(tp)}, d_v]$
@@ -478,10 +479,11 @@ $$
 其中 $\gamma \in \mathbb{R}^{d_v}$ 是可学习的 RMSNorm 缩放权重，$\varepsilon$ 为 `rms_norm_eps`。
 
 **输入形状**：
-```
-core_attn_out: [B*T, H_v^(tp), d_v]  （reshape 为 [B*T, H_v^(tp) * d_v]）
-z:            [B*T, H_v^(tp), d_v]  （reshape 为 [B*T, H_v^(tp) * d_v]）
-```
+
+| 参数 | 形状 | 说明 |
+| --- | --- | --- |
+| `core_attn_out` | $[B \cdot T, H_v^{(tp)}, d_v]$ | reshape 为 $[B \cdot T, H_v^{(tp)} \cdot d_v]$ |
+| `z` | $[B \cdot T, H_v^{(tp)}, d_v]$ | reshape 为 $[B \cdot T, H_v^{(tp)} \cdot d_v]$ |
 
 **输出形状**：`norm_out`: $[B, T, H_v^{(tp)}, d_v]$
 
@@ -618,12 +620,7 @@ bool is_full_attention_layer(int layer_id) const {
 
 线性注意力引入了两类新的缓存结构（定义于 `kv_cache_utils.h`）：
 
-```
-LinearAttentionKVCacheTensors {
-    conv_cache: [num_linear_layers, max_batch, K-1, 2*K_size+V_size]
-    ssm_cache:  [num_linear_layers, max_batch, H_v, d_v, d_k]
-}
-```
-
-- `conv_cache`：保存 causal conv 最近 $K-1 = 3$ 个历史输入，用于 decode 时的增量卷积
-- `ssm_cache`：保存每个 batch 每个 head 的 $S_t$ 递推状态矩阵，注意存储布局为 $[d_v, d_k]$（方便 NPU kernel 的 ACL 算子访问维度）
+| 缓存类型 | 形状 | 说明 |
+| --- | --- | --- |
+| `conv_cache` | $[num\_linear\_layers, max\_batch, K-1, 2K_{size}+V_{size}]$ | 保存 causal conv 最近 $K-1 = 3$ 个历史输入，用于 decode 时的增量卷积 |
+| `ssm_cache` | $[num\_linear\_layers, max\_batch, H_v, d_v, d_k]$ | 保存每个 batch 每个 head 的 $S_t$ 递推状态矩阵，存储布局为 $[d_v, d_k]$（方便 NPU kernel 的 ACL 算子访问维度） |
