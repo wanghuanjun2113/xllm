@@ -37,6 +37,30 @@ Qwen3.5 系列引入了混合注意力机制：部分层使用标准 Full Attent
 - Full KV 与 Linear State 联动命中与淘汰，保证 prefix 复用的正确性。
 - NPU 显存三池分离布局，所有状态数据常驻显存，避免动态分配带来的性能抖动。
 
+### 2.4 线性注意力状态缓存大小分析
+
+Full Attention KV Cache 按 token 粒度缓存，每 token 每层大小为 `2 × KV_Heads × Head_Dim × sizeof(bf16)`。Linear Attention State 按 checkpoint 粒度缓存（默认 1024 token 间隔），包含所有 Linear 层的 conv state 和 ssm state。
+
+**模型关键参数：**
+
+| 模型 | 层数 | Full 层数 | Linear 层数 | Hidden | KV Heads | Linear V Heads | MoE |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Qwen3.5-27B | 64 | 16 | 48 | 5120 | 4 | 48 | N/A |
+| Qwen3.5-35B-A3B | 40 | 10 | 30 | 2048 | 2 | 32 | 256 experts, top-8 |
+| Qwen3.5-397B-A17B | 60 | 15 | 45 | 4096 | 2 | 64 | 512 experts, top-10 |
+
+通用参数：Head Dim = 256，Linear Dim = 128，conv_kernel_dim = 4，dtype = bf16，ssm_dtype = float32。
+
+**KV Cache 与 Linear State 大小对比（当前 FP32 SSM）：**
+
+| 模型 | Full KV / token (全 Full 层) | Conv / checkpoint (全 Linear 层) | SSM / checkpoint (全 Linear 层) | 单 checkpoint 合计 | 摊销 / token |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.5-27B | 64 KiB | 2.8 MiB | 144 MiB | 146.8 MiB | 146.8 KiB |
+| Qwen3.5-35B-A3B | 20 KiB | 1.4 MiB | 60 MiB | 61.4 MiB | 61.4 KiB |
+| Qwen3.5-397B-A17B | 30 KiB | 3.2 MiB | 180 MiB | 183.2 MiB | 183.2 KiB |
+
+结论：Linear State 单 checkpoint 体积远大于 Full KV 单 token，必须采用稀疏 checkpoint。SSM state 占比最高（>95%），是显存规划的主要约束。
+
 ## 3. Detailed Design
 
 ### 3.1 稀疏 Checkpoint
@@ -191,6 +215,29 @@ Full KV 和 Linear State 必须同时命中才能复用 prefix，因此驱逐需
 Full KV 和 Linear State 使用独立的 prefix hash 链，分别匹配后取交集。
 
 **否决原因**：增加 hash 计算与存储开销。共享 hash 链已能正确表达 prefix 的语义等价性，且 Linear State 只需在 checkpoint 边界记录 hash 值，无需额外存储。
+
+### 6.4 SSM State 降精度至 FP16
+
+当前 xLLM 中 SSM state 使用 float32 存储，占 Linear State 总量的 >95%。若将 ssm_dtype 从 float32 降为 bfloat16，SSM state 显存减半。
+
+**FP16 SSM 大小对比：**
+
+| 模型 | SSM (FP32) | SSM (FP16) | Checkpoint 合计 (FP32) | Checkpoint 合计 (FP16) | 显存节省 |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.5-27B | 144 MiB | 72 MiB | 146.8 MiB | 74.8 MiB | 49.0% |
+| Qwen3.5-35B-A3B | 60 MiB | 30 MiB | 61.4 MiB | 31.4 MiB | 48.9% |
+| Qwen3.5-397B-A17B | 180 MiB | 90 MiB | 183.2 MiB | 93.2 MiB | 49.1% |
+
+**优势**：
+- Checkpoint 显存占用降低约 50%，可直接多存一倍 checkpoint slot，或等量显存下支持更长 prefix。
+- Live slot 同样减半，降低请求运行时的显存开销。
+- 实现简单：仅需修改 ssm tensor 创建时的 dtype，checkpoint 存储和恢复逻辑无需改动。
+
+**风险**：
+- Gated DeltaNet 的 ssm state 在递推过程中涉及大量乘加运算，精度从 FP32 降至 FP16 可能导致数值误差累积，影响模型输出质量。需要针对目标场景做精度验证（perplexity 回归、长上下文任务）。
+- 部分硬件（如 Ascend NPU）的 FP16 吞吐虽高但动态范围有限，极端值可能出现上溢/下溢。
+
+**建议**：作为高优先级候选方案，分两阶段推进——Phase 1 以 FP32 上线确保功能正确性；Phase 2 在回归测试通过后切换至 FP16。
 
 ## 7. Open Questions
 
