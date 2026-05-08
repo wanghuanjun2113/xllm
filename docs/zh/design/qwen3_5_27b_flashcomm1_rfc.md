@@ -200,12 +200,8 @@ FlashComm1Context build_flash_comm1_context(
 建议增加一组工具函数，避免把 slice/pad/gather 逻辑散落到模型层：
 
 ```cpp
-// Embedding 后：将完整 hidden 切成本 rank 的 sequence shard
-torch::Tensor shard_sequence(
-    const torch::Tensor& input,
-    const FlashComm1Context& fc1_context);
-
 // Column-parallel 前：将 sequence shard 恢复为完整 sequence
+// FC1 关闭时直接返回 input，无额外开销
 torch::Tensor gather_sequence(
     const torch::Tensor& input,
     const FlashComm1Context& fc1_context,
@@ -216,7 +212,30 @@ torch::Tensor gather_and_unpad_sequence(
     const torch::Tensor& input,
     const FlashComm1Context& fc1_context,
     ProcessGroup* tp_group);
+
+// Residual 对齐：当 residual 仍为完整 [S, H] 时，chunk 到 [S/TP, H]
+torch::Tensor maybe_chunk_residual(
+    const torch::Tensor& x,
+    const torch::Tensor& residual,
+    const FlashComm1Context& fc1_context);
+
+// Row-parallel 后：FC1 时 pad + reduce_scatter，否则 all_reduce
+torch::Tensor maybe_pad_and_reduce(
+    const torch::Tensor& input,
+    const FlashComm1Context& fc1_context,
+    ProcessGroup* tp_group);
 ```
+
+**vllm-ascend 对应**：
+
+| xllm 函数 | vllm-ascend 对应 | 位置 |
+|-----------|-----------------|------|
+| `gather_sequence` | `maybe_all_gather_and_maybe_unpad` | `register_custom_ops.py:40-70` |
+| `gather_and_unpad_sequence` | `_all_gather_hidden_states` | `model_runner_v1.py:1924-1930` |
+| `maybe_chunk_residual` | `maybe_chunk_residual` | `register_custom_ops.py:23-37` |
+| `maybe_pad_and_reduce` | `maybe_pad_and_reduce` | `register_custom_ops.py:73-105` |
+
+注意：`shard_sequence` 不再列为必要算子。首层不做显式 scatter，sequence-sharded 状态由第一个 row-parallel 层的 `reduce_scatter` 自然产生（见 6.9 节）。
 
 ### 5.5 RowParallelLinear 通信模式
 
@@ -309,8 +328,7 @@ FC1 适配后建议变为：
 
 ```text
 tokens -> embed_tokens
-       -> shard_sequence if FC1
-       -> layers with fc1_context
+       -> layers with fc1_context         (首层不做 shard，依赖首个 reduce_scatter 自然产生 [S/TP, H])
        -> final norm on shard
        -> gather_and_unpad if logits path needs full selected tokens
        -> ModelOutput
@@ -470,6 +488,11 @@ padding 的原因：`reduce_scatter` 要求输入在 sequence 维上能被 TP si
 
 FC1 关闭时或 token 数已经整除 TP size 时，无需 pad。
 
+**vllm-ascend 对应**：
+- `pad_size` 计算在 `set_ascend_forward_context` 中完成（`ascend_forward_context.py:132-161`）
+- 调度层 rounding 在 `_pad_for_sequence_parallelism` 中完成（`model_runner_v1.py:1981-1987`）
+- 实际 `F.pad` 在使用点内联执行（`maybe_pad_and_reduce`、`SequenceRowParallelOp.matmul_and_reduce` 等）
+
 **注意事项**：
 
 - `positions`、`AttentionMetadata`、`KVCache` 更新仍以真实 token 为准，不能把 padding token 写入有效 KV
@@ -479,15 +502,26 @@ FC1 关闭时或 token 数已经整除 TP size 时，无需 pad。
 
 **首层（Embedding → 第一个 Decoder Layer）**：
 
-- Embedding 输出的 hidden states 是 `[S, H]`（完整 sequence）
-- 第一个 Decoder Layer 需要在进入前将 hidden states 切分为 `[S/TP, H]`
-- 实现：在进入 decoder layers 循环前调用 `shard_sequence()`
+两种可选方案：
+
+**方案 A（推荐）：不做显式 shard，依赖首个 reduce_scatter 自然产生**
+
+Embedding 输出 `[S, H]` 直接进入第一个 Decoder Layer。第一个 Decoder Layer 的第一个 column-parallel 投影（`qkv_proj` 或 GDN 的 `in_proj_qkv`）前的 `gather_sequence` 对于完整 `[S, H]` 输入是 no-op（all_gather 单卡输入等于自身）。第一个 row-parallel 层（`o_proj`）的 `reduce_scatter` 自然将 `[S, H]` 切分为 `[S/TP, H]`。这是 vllm-ascend 采用的方案，实现更简洁。
+
+vllm-ascend 参考：`_maybe_all_gather_and_maybe_unpad` 在 FC1 关闭时直接返回输入，FC1 开启但输入已经是完整 sequence 时 all_gather 等价于 no-op。
+
+**方案 B：显式 shard**
+
+在进入 decoder layers 循环前调用 `shard_sequence()` 将 `[S, H]` 切分为 `[S/TP, H]`。更明确但多一步切分操作。
+
+**建议采用方案 A**，与 vllm-ascend 保持一致，减少首层特殊处理。
 
 **末层（最后一个 Decoder Layer → LM Head）**：
 
 - 最后一个 Decoder Layer 输出是 `[S/TP, H]`
 - LM Head 需要完整 sequence，需要在进入前执行 `all_gather` 恢复 `[S, H]`
 - 实现：在 decoder layers 循环后、LM Head 前调用 `gather_and_unpad_sequence()`
+- vllm-ascend 参考：`model_runner_v1.py` 中的 `_all_gather_hidden_states` 执行 `all_gather + x[:-pad_size]` 截断
 
 ### 6.10 适配点总结
 
@@ -501,7 +535,7 @@ FC1 关闭时或 token 数已经整除 TP size 时，无需 pad。
 | Attention | `qwen3_next_attention.cpp` | 新增逻辑 | qkv_proj 前 gather，o_proj 用 reduce_scatter |
 | DenseMLP | `dense_mlp.cpp` | 新增逻辑 | gate_up_proj 前 gather，down_proj 用 reduce_scatter |
 | GDN | `qwen3_gated_delta_net_base.cpp` | 新增逻辑 | 入口 gather，o_proj 用 reduce_scatter |
-| Model 入口 | `qwen3_next_hybrid_base.h` | 新增逻辑 | 首层 shard、末层 gather_and_unpad |
+| Model 入口 | `qwen3_next_hybrid_base.h` | 新增逻辑 | 末层 gather_and_unpad（首层不做 shard） |
 | 配置开关 | `global_flags.h`, `options.h` | 新增配置 | `enable_flashcomm1`、`flashcomm1_min_prefill_tokens` |
 | Token Padding | scheduler / model runner | 新增逻辑 | pad 到 TP 对齐 |
 
@@ -593,15 +627,20 @@ torch::Tensor unpad_after_fc1(const torch::Tensor& hidden_states, int pad_size) 
 
 ### 7.4 算子改动总结
 
-| 算子 | 类型 | 适用层 | 说明 |
-|------|------|--------|------|
-| `matmul_reduce_scatter` | 新增（融合） | `o_proj`, `down_proj` | Matmul + ReduceScatter 融合 kernel |
-| `reduce_scatter` | 使用现有 | `o_proj`, `down_proj` | 分步路径退化 |
-| `gather` (AllGather) | 使用现有 | `qkv_proj`, `gate_up_proj`, GDN 投影 | 恢复完整 sequence |
-| `shard_sequence` | 新增 | 模型入口 | 首层切分 hidden states |
-| `gather_sequence` | 新增 | 各 layer 调用点 | Column-parallel 前 AllGather |
-| `gather_and_unpad_sequence` | 新增 | 模型出口 | 末层恢复完整 sequence 并 unpad |
-| `pad_for_fc1` | 新增 | scheduler/runner | Token padding |
+| 算子 | 类型 | 适用层 | 说明 | vllm-ascend 参考 |
+|------|------|--------|------|-----------------|
+| `matmul_reduce_scatter` | 新增（融合） | `o_proj`, `down_proj` | Matmul + ReduceScatter 融合 kernel | `npu_mm_reduce_scatter_base` (`linear_op.py`) |
+| `maybe_pad_and_reduce` | 新增 | `o_proj`, `down_proj` | FC1 时 pad+reduce_scatter，否则 all_reduce | `maybe_pad_and_reduce` (`register_custom_ops.py:73-105`) |
+| `gather` (AllGather) | 使用现有 | `qkv_proj`, `gate_up_proj`, GDN 投影 | 恢复完整 sequence | `maybe_all_gather_and_maybe_unpad` (`register_custom_ops.py:40-70`) |
+| `gather_and_unpad_sequence` | 新增 | 模型出口 | 末层 all_gather + unpad | `_all_gather_hidden_states` (`model_runner_v1.py:1924-1930`) |
+| `maybe_chunk_residual` | 新增 | Decoder Layer | 对齐 residual 与 reduce_scatter 输出 | `maybe_chunk_residual` (`register_custom_ops.py:23-37`) |
+| `pad_for_fc1` | 新增 | scheduler/runner | Token padding，pad_size 计算 | `_pad_for_sequence_parallelism` (`model_runner_v1.py:1981-1987`) |
+
+**说明**：
+
+- `shard_sequence` 在 vllm-ascend 中没有对应算子。vllm-ascend 不做显式首层 scatter，sequence-sharded 状态由第一个 row-parallel 层的 `reduce_scatter` 自然产生（见 6.9 节方案 A）。xllm 建议采用相同策略，因此 `shard_sequence` 不再作为必要算子。
+- `maybe_chunk_residual` 用于在 residual 仍为完整 `[S, H]` 时，将其 chunk 到与 reduce_scatter 输出一致的 `[S/TP, H]`。vllm-ascend 使用 `torch.chunk(residual, tp_size, dim=0)[tp_rank]` 实现。
+- `maybe_pad_and_reduce` 封装了 FC1 的 row-parallel 通信策略：FC1 启用时 pad + reduce_scatter，关闭时退化为 all_reduce。
 
 ## 8. 配置与启用
 
