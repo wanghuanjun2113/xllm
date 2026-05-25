@@ -500,6 +500,14 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   if (args_.linear_num_value_heads() > 0) {
     int64_t head_k_dim = args_.linear_key_head_dim();
     int64_t head_v_dim = args_.linear_value_head_dim();
+    const bool enable_qwen3_5_spec_verify =
+        options_.num_speculative_tokens() > 0 && !options_.is_draft_engine() &&
+        (options_.speculative_algorithm() == "MTP" ||
+         options_.speculative_algorithm() == "mtp") &&
+        (args_.model_type() == "qwen3_5" ||
+         args_.model_type() == "qwen3_5_moe");
+    const int64_t num_speculative_tokens =
+        enable_qwen3_5_spec_verify ? options_.num_speculative_tokens() : 0;
 
     // Parse mamba_ssm_dtype if specified
     int64_t ssm_dtype_size =
@@ -507,11 +515,16 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
 
     int64_t linear_ssm_slot_size =
         ssm_dtype_size * n_local_linear_v_heads_ * head_k_dim * head_v_dim;
-    int64_t linear_conv_slot_size = dtype_size *
-                                    (head_k_dim * n_local_linear_k_heads_ * 2 +
-                                     head_v_dim * n_local_linear_v_heads_) *
-                                    (args_.linear_conv_kernel_dim() - 1);
-    linear_slot_size = linear_ssm_slot_size + linear_conv_slot_size;
+    int64_t linear_conv_slot_size =
+        dtype_size *
+        (head_k_dim * n_local_linear_k_heads_ * 2 +
+         head_v_dim * n_local_linear_v_heads_) *
+        (args_.linear_conv_kernel_dim() - 1 + num_speculative_tokens);
+    linear_slot_size = linear_conv_slot_size +
+                       linear_ssm_slot_size * (num_speculative_tokens + 1);
+    kv_cache_cap.linear_conv_state_len() =
+        args_.linear_conv_kernel_dim() - 1 + num_speculative_tokens;
+    kv_cache_cap.linear_ssm_checkpoint_stride() = num_speculative_tokens + 1;
   }
   kv_cache_cap.slot_size() = slot_size;
   kv_cache_cap.index_slot_size() = index_slot_size;
@@ -528,7 +541,7 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   }
 #endif
 
-  kv_cache_cap.num_linear_state_blocks() = FLAGS_max_seqs_per_batch + 2;
+  kv_cache_cap.num_linear_state_blocks() = FLAGS_max_concurrent_requests + 2;
   for (int64_t layer_id = 0; layer_id < kv_cache_cap.n_layers(); ++layer_id) {
     if (is_full_attention_layer(args_, layer_id)) {
       ++kv_cache_cap.num_full_attention_layers();
@@ -551,8 +564,8 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
     CHECK_GT(kv_cache_cap.cache_size_in_bytes(),
              kv_cache_cap.linear_cache_size_in_bytes())
         << "failed to reserve linear state cache for linear-attention layers: "
-        << "max_seqs_per_batch (" << FLAGS_max_seqs_per_batch
-        << ") is too large. Please reduce max_seqs_per_batch to less than "
+        << "max_concurrent_requests (" << FLAGS_max_concurrent_requests
+        << ") is too large. Please reduce max_concurrent_requests to less than "
         << kv_cache_cap.cache_size_in_bytes() /
                    (kv_cache_cap.num_linear_attention_layers() *
                     kv_cache_cap.linear_slot_size()) -

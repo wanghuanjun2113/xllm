@@ -835,6 +835,29 @@ std::pair<torch::Tensor, torch::Tensor> fused_recurrent_gated_delta_rule(
 #endif
 }
 
+torch::Tensor fused_sigmoid_gating_delta_rule_update(
+    FusedSigmoidGatingDeltaRuleUpdateParams& params) {
+#if defined(USE_NPU)
+  return npu::npu_fused_sigmoid_gating_delta_rule_update(
+      params.A_log,
+      params.a,
+      params.dt_bias,
+      params.q,
+      params.k,
+      params.v,
+      params.b,
+      params.initial_state_source,
+      params.initial_state_indices,
+      params.cu_seqlens,
+      params.scale,
+      params.use_qk_l2norm_in_kernel,
+      params.softplus_beta,
+      params.softplus_threshold);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
 torch::Tensor fp8_scaled_matmul(Fp8ScaledMatmulParams& params) {
 #if defined(USE_CUDA)
   auto out_2d = cuda::fp8_scaled_matmul(params.a,
@@ -940,7 +963,8 @@ torch::Tensor causal_conv1d_update(CausalConv1dUpdateParams& params) {
                                           params.pad_slot_id,
                                           params.block_idx_last_scheduled_token,
                                           params.initial_state_idx,
-                                          params.validate_data);
+                                          params.validate_data,
+                                          params.num_accepted_tokens);
 
 #else
   NOT_IMPLEMENTED();
@@ -1084,6 +1108,34 @@ torch::Tensor recurrent_gated_delta_rule(
                                              num_accepted_tokens,
                                              g,
                                              gk);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor causal_conv1d(const torch::Tensor& x,
+                            const torch::Tensor& weight,
+                            const torch::Tensor& conv_state,
+                            const std::optional<torch::Tensor>& bias_opt,
+                            const torch::IntArrayRef query_start_loc_opt,
+                            const torch::IntArrayRef cache_indices_opt,
+                            const torch::IntArrayRef initial_state_mode_opt,
+                            const torch::IntArrayRef num_accepted_tokens_opt,
+                            int64_t activation_mode,
+                            int64_t pad_slot_id,
+                            int64_t run_mode) {
+#if defined(USE_NPU)
+  return npu::causal_conv1d(x,
+                            weight,
+                            conv_state,
+                            bias_opt,
+                            query_start_loc_opt,
+                            cache_indices_opt,
+                            initial_state_mode_opt,
+                            num_accepted_tokens_opt,
+                            activation_mode,
+                            pad_slot_id,
+                            run_mode);
 #else
   NOT_IMPLEMENTED();
 #endif

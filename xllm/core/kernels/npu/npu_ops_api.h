@@ -17,7 +17,9 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <optional>
+#include <string>
 #include <tuple>
+#include <vector>
 
 #include "custom_functions_npu/atb_common.h"
 
@@ -44,6 +46,32 @@ void batch_decode(const torch::Tensor& query,
                   const torch::Tensor& block_table,
                   const torch::Tensor& seq_lens,
                   torch::Tensor& output);
+
+void batch_chunked_paged_prefill(const torch::Tensor& query,
+                                 const torch::Tensor& k_cache,
+                                 const torch::Tensor& v_cache,
+                                 float scale,
+                                 const torch::Tensor& block_table,
+                                 const torch::Tensor& seq_lens,
+                                 const torch::Tensor& attn_mask,
+                                 const torch::Tensor& q_seq_lens,
+                                 torch::Tensor& output);
+
+std::tuple<torch::Tensor, torch::Tensor> npu_fused_infer_attention(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& atten_mask,
+    const std::optional<torch::Tensor>& block_table,
+    const std::vector<int64_t>& actual_seq_lengths,
+    const std::vector<int64_t>& actual_seq_lengths_kv,
+    int64_t num_heads,
+    int64_t num_key_value_heads,
+    double scale,
+    int64_t block_size,
+    int64_t sparse_mode,
+    const std::string& input_layout,
+    bool softmax_lse_flag = false);
 
 // Custom batch decode for ACL graph execution
 // This variant uses CustomPagedAttention to avoid .to(kCPU) operations
@@ -153,4 +181,16 @@ torch::Tensor npu_recurrent_gated_delta_rule(
     const std::optional<torch::Tensor>& num_accepted_tokens,
     const std::optional<torch::Tensor>& g,
     const std::optional<torch::Tensor>& gk);
+
+torch::Tensor causal_conv1d(const torch::Tensor& x,
+                            const torch::Tensor& weight,
+                            const torch::Tensor& conv_state,
+                            const std::optional<torch::Tensor>& bias_opt,
+                            const torch::IntArrayRef query_start_loc_opt,
+                            const torch::IntArrayRef cache_indices_opt,
+                            const torch::IntArrayRef initial_state_mode_opt,
+                            const torch::IntArrayRef num_accepted_tokens_opt,
+                            int64_t activation_mode,
+                            int64_t pad_slot_id,
+                            int64_t run_mode);
 }  // namespace xllm::kernel::npu

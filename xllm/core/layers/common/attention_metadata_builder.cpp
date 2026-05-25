@@ -16,6 +16,7 @@ limitations under the License.
 #include "attention_metadata_builder.h"
 
 #include <numeric>
+#include <vector>
 
 #include "attention_metadata.h"
 #include "core/common/global_flags.h"
@@ -49,6 +50,8 @@ AttentionMetadata build_attention_metadata(
                                          params.kv_seq_lens_vec.end(),
                                          int64_t{0});
   }
+  attn_metadata.kv_seq_lens_vec = params.kv_seq_lens_vec;
+  attn_metadata.q_seq_lens_vec = params.q_seq_lens_vec;
   attn_metadata.slot_mapping = params.new_cache_slots;
   attn_metadata.compute_dtype = compute_dtype;
 
@@ -76,6 +79,21 @@ AttentionMetadata build_attention_metadata(
 #endif
 
 #if defined(USE_NPU)
+  attn_metadata.is_spec_verify = params.is_spec_verify;
+  attn_metadata.use_expanded_decode_for_spec_verify_attention =
+      params.graph_buffer.use_expanded_decode_for_spec_verify_attention;
+  if (attn_metadata.use_expanded_decode_for_spec_verify_attention) {
+    attn_metadata.expanded_kv_seq_lens =
+        params.graph_buffer.expanded_kv_seq_lens;
+    attn_metadata.expanded_block_table =
+        params.graph_buffer.expanded_block_tables;
+    attn_metadata.expanded_paged_attention_tiling_data =
+        params.graph_buffer.expanded_tiling_data;
+    if (!params.graph_buffer.expanded_kv_seq_lens_vec.empty()) {
+      attn_metadata.expanded_kv_seq_lens_host = torch::tensor(
+          params.graph_buffer.expanded_kv_seq_lens_vec, torch::kInt);
+    }
+  }
   // Determine if we should use ACL graph mode:
   // - FLAGS_enable_graph must be enabled
   // - Must be decode phase (not prefill)
@@ -89,16 +107,67 @@ AttentionMetadata build_attention_metadata(
     // ACL graph mode: use CustomPagedAttention with tiling_data on device
     attn_metadata.paged_attention_tiling_data = params.graph_buffer.tiling_data;
   }
-  // Provide host seq_lens for NPU kernels (required by CustomPagedAttention).
+  // Provide capture-time host seq_lens for NPU kernels. ACL graph replay must
+  // rely on fixed-address device inputs such as tiling_data, not mutable host
+  // tensors.
+  if (!params.q_seq_lens_vec.empty()) {
+    attn_metadata.q_seq_lens_host =
+        torch::tensor(params.q_seq_lens_vec, torch::kInt);
+  }
   if (!params.kv_seq_lens_vec.empty()) {
     attn_metadata.kv_seq_lens_host =
         torch::tensor(params.kv_seq_lens_vec, torch::kInt);
+  }
+  if (!params.q_seq_lens_vec.empty()) {
+    std::vector<int64_t> q_cu;
+    q_cu.reserve(params.q_seq_lens_vec.size());
+    int64_t total = 0;
+    for (int32_t len : params.q_seq_lens_vec) {
+      total += len;
+      q_cu.emplace_back(total);
+    }
+    attn_metadata.q_cu_seq_lens_host_vec = std::move(q_cu);
+  }
+  if (!params.kv_seq_lens_vec.empty()) {
+    std::vector<int64_t> kv_cu;
+    kv_cu.reserve(params.kv_seq_lens_vec.size());
+    int64_t total = 0;
+    for (int32_t len : params.kv_seq_lens_vec) {
+      total += len;
+      kv_cu.emplace_back(total);
+    }
+    attn_metadata.kv_cu_seq_lens_host_vec = std::move(kv_cu);
+    // Non-cumulative per-sequence lengths for chunked_prefill mode.
+    attn_metadata.kv_seq_lens_host_vec.reserve(params.kv_seq_lens_vec.size());
+    for (int32_t len : params.kv_seq_lens_vec) {
+      attn_metadata.kv_seq_lens_host_vec.emplace_back(len);
+    }
+  }
+  if (!is_decode &&
+      !attn_metadata.use_expanded_decode_for_spec_verify_attention) {
+    constexpr int64_t kFiaSplitFuseMaskSize = 2048;
+    auto cpu_options = torch::TensorOptions().dtype(torch::kFloat32);
+    torch::Device mask_device = torch::kCPU;
+    if (params.q_seq_lens.defined()) {
+      mask_device = params.q_seq_lens.device();
+    } else if (params.input_embedding.defined()) {
+      mask_device = params.input_embedding.device();
+    }
+    attn_metadata.fia_attn_mask =
+        torch::triu(torch::ones({kFiaSplitFuseMaskSize, kFiaSplitFuseMaskSize},
+                                cpu_options),
+                    1)
+            .to(torch::kInt8)
+            .to(mask_device)
+            .contiguous();
   }
 #endif
   attn_metadata.is_chunked_prefill =
       params.batch_forward_type.is_mixed() ||
       params.batch_forward_type.is_chunked_prefill();
   attn_metadata.is_prefill = params.batch_forward_type.is_prefill();
+
+  // enable_mla is for DeepSeekv32 on mlu device
   if (!attn_metadata.is_prefill || enable_mla) {
     attn_metadata.block_table = params.block_tables;
 #if !defined(USE_NPU) && !defined(USE_CUDA)
@@ -114,10 +183,15 @@ AttentionMetadata build_attention_metadata(
   }
   if (params.q_seq_lens.defined()) {
     attn_metadata.q_seq_lens = params.q_seq_lens;
-    torch::Tensor cumsum_tensor =
-        torch::cumsum(attn_metadata.q_seq_lens, 0).to(torch::kInt32);
-    auto zero = torch::zeros({1}, cumsum_tensor.options());
-    attn_metadata.q_cu_seq_lens = torch::cat({zero, cumsum_tensor}, 0);
+    if (params.graph_buffer.tiling_data.defined() &&
+        params.q_cu_seq_lens.defined()) {
+      attn_metadata.q_cu_seq_lens = params.q_cu_seq_lens;
+    } else {
+      torch::Tensor cumsum_tensor =
+          torch::cumsum(attn_metadata.q_seq_lens, 0).to(torch::kInt32);
+      auto zero = torch::zeros({1}, cumsum_tensor.options());
+      attn_metadata.q_cu_seq_lens = torch::cat({zero, cumsum_tensor}, 0);
+    }
   }
 #endif
 

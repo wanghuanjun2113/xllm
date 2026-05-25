@@ -106,7 +106,8 @@ void resolve_npu_kernel_backend_for_options(Options* options) {
     return;
   }
 
-  const std::string model_type = get_model_type(options->model_path());
+  const std::string model_type =
+      util::get_model_type(options->model_path(), options->backend());
   std::string effective_backend;
   std::string resolved_name;
   std::string error_message;
@@ -274,6 +275,7 @@ Master::Master(const Options& options, EngineType type)
         .enable_disagg_pd(options_.enable_disagg_pd())
         .enable_service_routing(options_.enable_service_routing())
         .enable_schedule_overlap(options_.enable_schedule_overlap())
+        .enable_graph(options_.enable_graph())
         .enable_cache_upload(options_.enable_cache_upload())
         .enable_offline_inference(options_.enable_offline_inference())
         .spawn_worker_path(options_.spawn_worker_path())
@@ -325,6 +327,7 @@ Master::Master(const Options& options, EngineType type)
         .enable_disagg_pd(options_.enable_disagg_pd())
         .enable_service_routing(options_.enable_service_routing())
         .enable_schedule_overlap(options_.enable_schedule_overlap())
+        .enable_graph(options_.enable_graph())
         .enable_cache_upload(options_.enable_cache_upload())
         .host_blocks_factor(options_.host_blocks_factor())
         .enable_kvcache_store(options_.enable_kvcache_store())
