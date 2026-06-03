@@ -22,6 +22,7 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include "core/common/macros.h"
 #include "core/framework/kv_cache/kv_cache.h"
@@ -198,7 +199,8 @@ class GraphPersistentParam {
                                    const torch::Tensor& k_cache,
                                    const torch::Tensor& v_cache,
                                    const torch::Tensor& block_tables,
-                                   const ModelInputParams& input_params,
+                                   const torch::Tensor& kv_seq_lens,
+                                   const std::vector<int32_t>& kv_seq_lens_vec,
                                    aclrtStream stream);
 
   std::vector<int32_t> update_expanded_spec_decode_attention(
@@ -221,11 +223,14 @@ class GraphPersistentParam {
   // speculative decode mode), the mask needs to be passed to the attention
   // operation
   torch::Tensor persistent_mask_;
+  bool attention_mask_is_zero_ = true;
   torch::Tensor hidden_states_;
 
   torch::Tensor q_seq_lens_;
   torch::Tensor kv_seq_lens_;
   torch::Tensor expanded_kv_seq_lens_;
+  std::vector<int32_t> padded_kv_seq_lens_vec_;
+  std::vector<int32_t> padded_q_seq_lens_vec_;
 
   // for deepseekv3.2
   torch::Tensor q_cu_seq_lens_;

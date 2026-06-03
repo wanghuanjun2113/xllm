@@ -32,6 +32,9 @@ limitations under the License.
 #endif
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -76,6 +79,22 @@ constexpr uint32_t TIMEOUT_S = 60;      // second
 constexpr uint32_t TIMEOUT_MS = 60000;  // millisecond
 
 namespace {
+
+bool enable_acl_graph_cpu_trace() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("XLLM_ACL_GRAPH_CPU_TRACE");
+    return value != nullptr && value[0] != '\0' &&
+           std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "FALSE") != 0;
+  }();
+  return enabled;
+}
+
+int64_t cpu_trace_now_us() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 // During TP model initialization, each rank loads weights concurrently.
 // MoE weight assembly (especially stack/cat on large expert tensors) runs on
@@ -594,7 +613,16 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
   }
 
   if (!use_default_stream) {
+    const bool trace_sync = enable_acl_graph_cpu_trace();
+    const int64_t sync_start_us = trace_sync ? cpu_trace_now_us() : 0;
     prepare_stream_->synchronize();
+    if (trace_sync) {
+      LOG(INFO) << "[acl_graph_cpu_trace] WorkerImpl::prepare_stream_sync"
+                << " total_us=" << (cpu_trace_now_us() - sync_start_us)
+                << " token_count=" << processed_input.token_ids.numel()
+                << " is_decode="
+                << processed_input.input_params.batch_forward_type.is_decode();
+    }
   }
 }
 
