@@ -1,51 +1,90 @@
 # xLLM Coding Agent Instructions
 
+## Build Commands
+
+```bash
+# Build (device required)
+python setup.py build --device <npu|mlu|cuda|ilu|musa> --arch <x86|arm>
+
+# Build wheel
+python setup.py bdist_wheel --device <device>
+
+# Skip tests/export during build
+SKIP_TEST=1 python setup.py build --device <device>
+SKIP_EXPORT=1 python setup.py build --device <device>
+```
+
+CUDA builds require: `export TORCH_CUDA_ARCH_LIST="8.0 9.0 10.0"`
+
+## Test Commands
+
+```bash
+# Run all tests (via ctest, parallel except sequential tests)
+python setup.py test --device <device>
+
+# Run single test target
+python setup.py test --test-name <test_target> --device <device>
+# Example: python setup.py test --test-name platform_vmm_test --device npu
+```
+
+Sequential tests (fork conflicts): `ReduceScatterMultiDeviceTest`, `DeepEPMultiDeviceTest`, `AttentionMultiDeviceTest`, `FusedMoEAll2AllMultiDeviceTest`
+
+## Format Check
+
+```bash
+# Pre-commit hook (clang-format 20.1.6)
+pre-commit run --all-files
+
+# CI format check uses git-clang-format against base commit
+```
+
+## Hardware Backends
+
+NPU (Ascend), MLU, ILU, MUSA, CUDA. Docker build scripts in `cibuild/build_<device>.sh`.
+
+## Code Style
+
+**Required reading before editing `xllm/`:** [custom-code-style.md](.agents/skills/code-review/references/custom-code-style.md)
+
+Key rules:
+- Google-style clang-format (2-char indent, 80 column limit)
+- `#pragma once` headers, no relative includes
+- Copyright header required on all new files
+- `torch::` namespace, `CHECK`/`LOG(FATAL)` over `TORCH_CHECK`/exceptions
+- `snake_case_` member variables, `PascalCase` classes
+- Fixed-width integers (`int32_t`, `int64_t`), `static_cast` only
+
+## Code Review
+
+For review tasks: read [code-review/SKILL.md](.agents/skills/code-review/SKILL.md) then apply custom-code-style.md.
+
+## Git Workflow
+
+Commit format: `<type>: <subject>` (e.g., `feat: add rope kernel for npu.`)
+
+Types: `feat`, `bugfix`, `docs`, `test`, `refactor`, `chore`, `perf`, `model`, `build`, `release`
+
+Use `bugfix:` (not `fix:`). See [commit-format.md](.agents/skills/git-workflow/references/commit-format.md).
+
+## TileLang Ascend Kernels
+
+For NPU kernel work: read [tilelang-ascend-kernel/SKILL.md](.agents/skills/tilelang-ascend-kernel/SKILL.md).
+
+Key: run TileLang from repo root with `export TL_ROOT=$PWD/third_party/tilelang-ascend`.
+
 ## Directory Structure
 
 ```
-├── xllm/
-|   : main source folder
-│   ├── api_service/               # code for api services
-│   ├── c_api/                     # code for c api
-│   ├── cc_api/                    # code for cc api 
-│   ├── core/  
-│   │   : xllm core features folder
-│   │   ├── common/                
-│   │   ├── distributed_runtime/   # code for distributed and pd serving
-│   │   ├── framework/             # code for execution orchestration
-│   │   ├── kernels/               # adaption for npu kernels adaption
-│   │   ├── layers/                # model layers impl
-│   │   ├── platform/              # adaption for various platform
-│   │   ├── runtime/               # code for worker and executor
-│   │   ├── scheduler/             # code for batch and pd scheduler
-│   │   └── util/
-│   ├── function_call              # code for tool call parser
-│   ├── models/                    # models impl
-│   ├── parser/                    # parser reasoning
-│   ├── processors/                # code for vlm pre-processing
-│   ├── proto/                     # communication protocol
-│   ├── pybind/                    # code for python bind
-|   └── server/                    # xLLM server
-├── examples/                      # examples of calling xLLM
-├── tools/                         # code for npu time generations
-└── xllm.cpp                       # entrypoint of xLLM
+xllm/
+├── core/           # engine: framework/, runtime/, scheduler/, kernels/, layers/, platform/
+├── api_service/    # OpenAI/Anthropic service impl
+├── c_api/          # C API
+├── cc_api/         # C++ API
+├── models/         # model definitions
+├── pybind/         # Python bindings
+├── server/         # xLLM server entry
+├── parser/         # reasoning parser
+├── processors/     # VLM preprocessing
+├── function_call/  # tool call parser
+└── proto/          # gRPC/protobuf
 ```
-
-## Code Style Guide
-
-* Before editing, creating, refactoring, or reviewing any file under `xllm/`, you **MUST** read [custom-code-style.md](.agents/skills/code-review/references/custom-code-style.md).
-* The file above is a **required instruction file**, not an optional reference. Do not skip reading it.
-* Apply the rules in [custom-code-style.md](.agents/skills/code-review/references/custom-code-style.md) to **both code generation and code review**.
-* Follow DDD (Domain Driven Design) principles, and keep the codebase clean and maintainable.
-* If [custom-code-style.md](.agents/skills/code-review/references/custom-code-style.md) specifies a rule, that rule takes precedence over the Google C++/Python Style Guide.
-* Use the Google C++/Python Style Guide only for cases not specified in [custom-code-style.md](.agents/skills/code-review/references/custom-code-style.md).
-
-## Review Instructions
-
-* For code review tasks, you **MUST** first read [code-review/SKILL.md](.agents/skills/code-review/SKILL.md).
-* Then read [custom-code-style.md](.agents/skills/code-review/references/custom-code-style.md) and apply it during the review.
-* Review code changes for quality, security, performance, correctness, and maintainability following the project-specific standards.
-* Review code changes for DDD (Domain Driven Design) principles, and keep the codebase clean and maintainable.
-* Use the review workflow, checklist, severity rules, and output format defined in [code-review/SKILL.md](.agents/skills/code-review/SKILL.md).
-* Apply the Google C++/Python Style Guide only when the project-specific style guide does not define the rule.
-* Focus the review on the requested diff or changed files. Do not comment on unrelated code.

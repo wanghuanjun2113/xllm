@@ -63,4 +63,4 @@ xLLM 提供了强大的智能计算能力，通过硬件系统的算力优化与
 
 - [Graph Mode 设计文档](design/graph_mode_design.md)
 - [生成式推荐设计文档](design/generative_recommendation_design.md)
-
+- [Qwen3.5 Linear Attention 设计说明](design/qwen3_5_linear_attention_design.md)
