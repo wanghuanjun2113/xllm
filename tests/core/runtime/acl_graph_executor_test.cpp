@@ -44,6 +44,7 @@ limitations under the License.
 #include "core/runtime/acl_graph_persistent_param.h"
 #include "core/runtime/base_executor_impl.h"
 #include "core/runtime/options.h"
+#include "core/runtime/worker_impl.h"
 
 // Global test environment for ACL graph executor tests
 class AclGraphExecutorTestEnvironment : public ::testing::Environment {
@@ -92,6 +93,29 @@ const KVCache& first_full_attention_cache(
   LOG(FATAL) << "No full-attention KV cache found";
   std::abort();
 }
+
+class LinearAttentionPrepareWorker final : public WorkerImpl {
+ public:
+  LinearAttentionPrepareWorker(const ParallelArgs& parallel_args,
+                               const torch::Device& device,
+                               const runtime::Options& options)
+      : WorkerImpl(parallel_args, device, options) {
+    ModelArgs model_args;
+    model_args.layer_types({"linear_attention"});
+    dtype_ = torch::kFloat32;
+    context_ = ModelContext(
+        parallel_args,
+        model_args,
+        QuantArgs(),
+        torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  }
+
+  bool init_model(ModelContext&) override { return true; }
+
+  std::optional<ForwardOutput> step(const ForwardInput&) override {
+    return std::nullopt;
+  }
+};
 }  // namespace
 
 // Initialize glog for testing - use a function to ensure proper initialization
@@ -826,6 +850,35 @@ TEST(LinearStateRestoreTest, RestoreRequestedButUnresolvedColdStarts) {
   restore_linear_state_slots(kv_caches, cache_ops, has_initial_state);
   EXPECT_EQ(has_initial_state[0], 1);
   EXPECT_EQ(has_initial_state[1], 0);
+}
+
+TEST(WorkerImplTest, LinearAttentionPreparationUsesHostKvTokenCounts) {
+  const torch::Device device("npu:0");
+  const ParallelArgs parallel_args(0, 1, nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true);
+  LinearAttentionPrepareWorker worker(parallel_args, device, options);
+
+  const torch::TensorOptions int_options =
+      torch::TensorOptions().dtype(torch::kInt32).device(device);
+  ForwardInput input;
+  input.token_ids = torch::ones({4}, int_options);
+  input.positions = torch::arange(4, int_options);
+  input.device_tensors_ready = true;
+  input.input_params.meta.batch_forward_type = BatchForwardType::PREFILL;
+  input.input_params.meta.num_sequences = 4;
+  input.input_params.attention.host.q_seq_lens = {1, 1, 1, 1};
+  input.input_params.attention.host.kv_cache_tokens_nums = {0, 8};
+  input.input_params.attention.device.kv_cache_tokens_nums =
+      torch::tensor(std::vector<int32_t>{8, 0}, int_options);
+
+  ForwardInput processed_input;
+  worker.prepare_work_before_execute(input, processed_input);
+
+  EXPECT_EQ(processed_input.input_params.parallel.has_initial_state,
+            std::vector<int64_t>({0, 0, 1, 1}));
+  EXPECT_EQ(processed_input.input_params.parallel.query_start_loc,
+            std::vector<int64_t>({0, 1, 2, 3, 4}));
 }
 
 TEST_F(AclGraphExecutorTest, GraphDoubleBufferFlagControlsSlotCount) {
