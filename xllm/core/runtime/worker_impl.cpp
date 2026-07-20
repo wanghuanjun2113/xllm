@@ -204,35 +204,13 @@ void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
         input_params.parallel.query_start_loc[i] + seq_len;
   }
 
-  std::vector<int64_t> has_initial_state_values;
-  const auto& host_kv_cache_tokens_nums =
-      input_params.attention.host.kv_cache_tokens_nums;
-  // The host vector is the source used to rebuild the device input. Reuse it
-  // here to avoid a device comparison followed by a synchronous copy to host.
-  if (!host_kv_cache_tokens_nums.empty()) {
-    has_initial_state_values.reserve(host_kv_cache_tokens_nums.size());
-    for (int32_t num_tokens : host_kv_cache_tokens_nums) {
-      has_initial_state_values.emplace_back(num_tokens > 0 ? 1 : 0);
-    }
-  } else {
-    torch::Tensor has_initial_state_tensor =
-        input_params.attention.device.kv_cache_tokens_nums > 0;
-    torch::Tensor has_initial_state_int64 =
-        has_initial_state_tensor.contiguous()
-            .view({-1})
-            .to(torch::kCPU)
-            .to(torch::kInt64);
-    if (has_initial_state_int64.numel() > 0) {
-      const int64_t* has_initial_state_ptr =
-          has_initial_state_int64.data_ptr<int64_t>();
-      has_initial_state_values.assign(
-          has_initial_state_ptr,
-          has_initial_state_ptr + has_initial_state_int64.size(0));
-    }
-  }
-
-  const int64_t has_initial_state_size =
-      static_cast<int64_t>(has_initial_state_values.size());
+  torch::Tensor has_initial_state_tensor =
+      input_params.attention.device.kv_cache_tokens_nums > 0;
+  torch::Tensor has_initial_state_int64 = has_initial_state_tensor.contiguous()
+                                              .view({-1})
+                                              .to(torch::kCPU)
+                                              .to(torch::kInt64);
+  const int64_t has_initial_state_size = has_initial_state_int64.size(0);
   CHECK_GT(has_initial_state_size, 0)
       << "kv_cache_tokens_nums must not be empty for linear attention";
   CHECK(batch_size == has_initial_state_size ||
@@ -241,18 +219,21 @@ void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
       << "size, kv_cache_tokens_nums_size=" << has_initial_state_size
       << ", batch_size=" << batch_size;
   if (batch_size == has_initial_state_size) {
-    input_params.parallel.has_initial_state =
-        std::move(has_initial_state_values);
+    input_params.parallel.has_initial_state = std::vector<int64_t>(
+        has_initial_state_int64.data_ptr<int64_t>(),
+        has_initial_state_int64.data_ptr<int64_t>() + batch_size);
     return;
   }
 
   const int64_t repeat_count = batch_size / has_initial_state_size;
   input_params.parallel.has_initial_state.clear();
   input_params.parallel.has_initial_state.reserve(batch_size);
+  const int64_t* has_initial_state_ptr =
+      has_initial_state_int64.data_ptr<int64_t>();
   for (int64_t i = 0; i < has_initial_state_size; ++i) {
     for (int64_t repeat_idx = 0; repeat_idx < repeat_count; ++repeat_idx) {
       input_params.parallel.has_initial_state.push_back(
-          has_initial_state_values[static_cast<size_t>(i)]);
+          has_initial_state_ptr[i]);
     }
   }
 }
